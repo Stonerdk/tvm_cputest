@@ -23,6 +23,8 @@
  */
 
 #include <dmlc/json.h>
+#include <emmintrin.h>
+#include <papi.h>
 #include <tvm/runtime/c_backend_api.h>
 #include <tvm/runtime/data_type.h>
 #include <tvm/runtime/packed_func.h>
@@ -879,40 +881,74 @@ PackedFunc WrapTimeEvaluator(PackedFunc pf, Device dev, int number, int repeat, 
     pf.CallPacked(args, &temp);
 
     // allocate two large arrays to flush L2 cache
-    NDArray arr1, arr2;
-    if (cache_flush_bytes > 0) {
-      arr1 = NDArray::Empty({cache_flush_bytes / 4}, {kDLInt, 32, 1}, dev);
-      arr2 = NDArray::Empty({cache_flush_bytes / 4}, {kDLInt, 32, 1}, dev);
-    }
 
     DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
+  if (PAPI_query_event(PAPI_L1_DCM) != PAPI_OK) {
+      fprintf(stderr, "PAPI_L1_DCM is not available on this system\n");
+    }
+    if (PAPI_query_event(PAPI_TOT_CYC) != PAPI_OK) {
+        fprintf(stderr, "PAPI_TOT_CYC is not available on this system\n");
+    }
+    if (PAPI_library_init(PAPI_VER_CURRENT) != PAPI_VER_CURRENT) {
+      fprintf(stderr, "PAPI library init error!\n");
+    }
+    if (PAPI_thread_init((unsigned long (*)(void))pthread_self) != PAPI_OK) {
+      fprintf(stderr, "PAPI thread init error!\n");
+    }
+    int NUM_EVENTS = 2;
+    int* events = new int[NUM_EVENTS];
+    events[0] = PAPI_L1_DCM;
+    events[1] = PAPI_TOT_CYC;
 
     for (int i = 0; i < repeat; ++i) {
       if (f_preproc != nullptr) {
         f_preproc.CallPacked(args, &temp);
       }
+
+      // flush cache
+      for (int j = 0; j < args.num_args; j++) {
+        DLTensor* arr = reinterpret_cast<DLTensor*>(args.values[j].v_handle);
+        size_t size = arr->dtype.bits / 8;  // 4
+        for (int k = 0; k < arr->ndim; k++) {
+          size *= arr->shape[k];
+        }
+        _mm_mfence();
+        for (size_t i = 0; i < size; i += 64) {  // 일반적으로 캐시 라인 크기는 64바이트
+          _mm_clflush(reinterpret_cast<char*>(arr->data) + i);
+        }
+      }
+
       double duration_ms = 0.0;
       int absolute_zero_times = 0;
-      do {
-        if (duration_ms > 0.0) {
-          const double golden_ratio = 1.618;
-          number = static_cast<int>(
-              std::max((min_repeat_ms / (duration_ms / number) + 1), number * golden_ratio));
+      // do {
+      if (duration_ms > 0.0) {
+        const double golden_ratio = 1.618;
+        number = static_cast<int>(
+            std::max((min_repeat_ms / (duration_ms / number) + 1), number * golden_ratio));
+      }
+      DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
+      // start timing
+      Timer t = Timer::Start(dev);
+      number = 1;
+      long long values[2];
+      for (int j = 0; j < number; ++j) {
+        if (auto g = PAPI_start_counters(events, NUM_EVENTS)) {
+          fprintf(stderr, "Error starting counters %d\n", g);
+          pthread_exit(NULL);
         }
-        if (cache_flush_bytes > 0) {
-          arr1.CopyFrom(arr2);
+        pf.CallPacked(args, &temp);
+        if (PAPI_stop_counters(values, NUM_EVENTS) != PAPI_OK) {
+          fprintf(stderr, "Error stopping counters\n");
+          pthread_exit(NULL);
         }
-        DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
-        // start timing
-        Timer t = Timer::Start(dev);
-        for (int j = 0; j < number; ++j) {
-          pf.CallPacked(args, &temp);
-        }
-        t->Stop();
-        int64_t t_nanos = t->SyncAndGetElapsedNanos();
-        if (t_nanos == 0) absolute_zero_times++;
-        duration_ms = t_nanos / 1e6;
-      } while (duration_ms < min_repeat_ms && absolute_zero_times < limit_zero_time_iterations);
+        printf("Thread %ld - L1 DCM: %lld, Total Cycles: %lld\n",
+               pthread_self(), values[0], values[1]);
+      }
+      t->Stop();
+      int64_t t_nanos = t->SyncAndGetElapsedNanos();
+      if (t_nanos == 0) absolute_zero_times++;
+      duration_ms = t_nanos / 1e6;
+      // } while (duration_ms < min_repeat_ms && absolute_zero_times < limit_zero_time_iterations);
 
       double speed = duration_ms / 1e3 / number;
       os.write(reinterpret_cast<char*>(&speed), sizeof(speed));

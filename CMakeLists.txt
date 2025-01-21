@@ -744,6 +744,8 @@ if(USE_THREADS AND NOT BUILD_FOR_HEXAGON)
   find_package(Threads REQUIRED)
   target_link_libraries(tvm PUBLIC Threads::Threads)
   target_link_libraries(tvm_runtime PUBLIC Threads::Threads)
+  target_link_libraries(tvm PUBLIC papi)
+  target_link_libraries(tvm_runtime PUBLIC papi)
 endif()
 
 if(NOT BUILD_DUMMY_LIBTVM)
